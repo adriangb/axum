@@ -121,13 +121,13 @@ where
         listener,
         make_service,
         executor: TokioExecutor,
-        connection_lifetime_limits: ConnectionLifetimeLimits::default(),
+        max_connection_age: None,
         _marker: PhantomData,
     }
 }
 
-/// Per-connection limits applied by [`serve`], used to bound the lifetime of
-/// individual connections.
+/// A cap on how long a connection keeps accepting new requests, applied by
+/// [`serve`] to bound the lifetime of individual connections.
 ///
 /// Closing connections after a bounded lifetime pressures clients to establish
 /// *new* connections, which is useful behind a load balancer (e.g. a Kubernetes
@@ -137,78 +137,72 @@ where
 /// It also bounds the worst case when a client's connection pool has no
 /// rotation of its own.
 ///
-/// The mechanism differs by protocol but the knobs are the same:
+/// Once a connection has been open for [`new`]'s duration (plus [`jitter`]), a
+/// graceful shutdown of that connection is started. The mechanism differs by
+/// protocol:
 ///
 /// - **HTTP/1**: the next response gets a `Connection: close` header and the
 ///   connection is closed once the in-flight request finishes.
-/// - **HTTP/2**: a `GOAWAY` is sent, so new streams are refused
-///   while in-flight streams are allowed to finish.
+/// - **HTTP/2**: a `GOAWAY` is sent, so new streams are refused while in-flight
+///   streams are allowed to finish.
 ///
 /// In both cases in-flight work is waited on for as long as it takes, unless
-/// [`max_connection_age_grace`] is set: once the grace period elapses the
-/// connection is closed even if a request is still in flight. See
-/// [`max_connection_age_grace`] for the trade-off.
+/// [`grace`] is set: once the grace period elapses the connection is closed even
+/// if a request is still in flight. See [`grace`] for the trade-off.
 ///
 /// # Example
 ///
 /// ```
 /// use std::time::Duration;
-/// use axum::{Router, routing::get, serve::ConnectionLifetimeLimits};
+/// use axum::{Router, routing::get, serve::MaxConnectionAge};
 ///
 /// # async {
 /// let router = Router::new().route("/", get(|| async { "Hello, World!" }));
 /// let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
 ///
-/// let limits = ConnectionLifetimeLimits::new()
-///     // Stop accepting new requests on a connection after this long.
-///     .max_connection_age(Duration::from_secs(10 * 60))
-///     // Random per-connection jitter added to the age, to avoid synchronized
-///     // reconnect storms when many connections were established at once.
-///     .max_connection_age_jitter(Duration::from_secs(60))
-///     // Hard cap on how long to wait for in-flight work after the age limit
-///     // fires before forcibly closing.
-///     .max_connection_age_grace(Duration::from_secs(30));
-///
 /// axum::serve(listener, router)
-///     .connection_lifetime_limits(limits)
+///     .max_connection_age(
+///         MaxConnectionAge::new(Duration::from_secs(10 * 60))
+///             // Random per-connection jitter added to the age, to avoid
+///             // synchronized reconnect storms when many connections were
+///             // established at once.
+///             .jitter(Duration::from_secs(60))
+///             // Hard cap on how long to wait for in-flight work after the age
+///             // limit fires before forcibly closing.
+///             .grace(Duration::from_secs(30)),
+///     )
 ///     .await;
 /// # };
 /// ```
 ///
-/// [`max_connection_age_grace`]: ConnectionLifetimeLimits::max_connection_age_grace
-#[derive(Clone, Debug, Default)]
+/// [`new`]: MaxConnectionAge::new
+/// [`jitter`]: MaxConnectionAge::jitter
+/// [`grace`]: MaxConnectionAge::grace
+#[derive(Clone, Debug)]
 #[must_use]
-pub struct ConnectionLifetimeLimits {
-    max_connection_age: Option<Duration>,
-    max_connection_age_jitter: Duration,
-    max_connection_age_grace: Option<Duration>,
+pub struct MaxConnectionAge {
+    age: Duration,
+    jitter: Duration,
+    grace: Option<Duration>,
 }
 
-impl ConnectionLifetimeLimits {
-    /// Create a new [`ConnectionLifetimeLimits`] with no limits set.
-    pub fn new() -> Self {
-        Self::default()
+impl MaxConnectionAge {
+    /// Create a new `MaxConnectionAge` that stops a connection from accepting
+    /// new requests once it has been open for `age`.
+    ///
+    /// Consider also setting [`jitter`] to avoid all connections opened around
+    /// the same time tearing down simultaneously.
+    ///
+    /// [`jitter`]: MaxConnectionAge::jitter
+    pub fn new(age: Duration) -> Self {
+        Self {
+            age,
+            jitter: Duration::ZERO,
+            grace: None,
+        }
     }
 
-    /// Set a cap on how long a connection keeps accepting new requests.
-    ///
-    /// Once a connection has been open for this long, a graceful shutdown of
-    /// that connection is started: HTTP/1 connections close after the in-flight
-    /// request completes (sending `Connection: close`), and HTTP/2 connections
-    /// send a `GOAWAY`, refusing new streams while letting in-flight ones finish
-    /// (bounded by [`max_connection_age_grace`] if set).
-    ///
-    /// Consider also setting [`max_connection_age_jitter`] to avoid all
-    /// connections opened around the same time tearing down simultaneously.
-    ///
-    /// [`max_connection_age_grace`]: ConnectionLifetimeLimits::max_connection_age_grace
-    /// [`max_connection_age_jitter`]: ConnectionLifetimeLimits::max_connection_age_jitter
-    pub fn max_connection_age(mut self, age: Duration) -> Self {
-        self.max_connection_age = Some(age);
-        self
-    }
-
-    /// Set the maximum random jitter added to [`max_connection_age`].
+    /// Set the maximum random jitter added to the age.
     ///
     /// Each connection adds a random duration in `[0, jitter]` to its age limit.
     /// This is important for avoiding synchronized reconnect storms when many
@@ -216,34 +210,29 @@ impl ConnectionLifetimeLimits {
     /// deploy): without it, every connection opened in the same instant tears
     /// down in the same instant once the age limit elapses.
     ///
-    /// Defaults to `Duration::ZERO`, i.e. no jitter. Has no effect unless
-    /// [`max_connection_age`] is also set.
-    ///
-    /// [`max_connection_age`]: ConnectionLifetimeLimits::max_connection_age
-    pub fn max_connection_age_jitter(mut self, jitter: Duration) -> Self {
-        self.max_connection_age_jitter = jitter;
+    /// Defaults to `Duration::ZERO`, i.e. no jitter.
+    pub fn jitter(mut self, jitter: Duration) -> Self {
+        self.jitter = jitter;
         self
     }
 
-    /// Set a hard cap on how long to wait for in-flight work after
-    /// [`max_connection_age`] fires before forcibly closing the connection.
+    /// Set a hard cap on how long to wait for in-flight work after the age
+    /// limit fires before forcibly closing the connection.
     ///
-    /// Without a grace period, [`max_connection_age`] only stops new requests:
-    /// the server waits however long it takes for in-flight work to finish
-    /// before closing the connection. Setting a grace period turns
-    /// `max_connection_age` (+ jitter) + grace into a hard deadline: when it
-    /// elapses the connection is closed *even if a request is still in flight*,
-    /// and the client never receives a response for it. This applies to HTTP/1
-    /// requests as well as HTTP/2 streams, so a handler that runs longer than
-    /// the age limit plus the grace period will never complete successfully.
-    /// Only set a grace period if bounding connection lifetime matters more
-    /// than letting slow requests finish.
+    /// Without a grace period the age limit only stops new requests: the server
+    /// waits however long it takes for in-flight work to finish before closing
+    /// the connection. Setting a grace period turns age (+ jitter) + grace into
+    /// a hard deadline: when it elapses the connection is closed *even if a
+    /// request is still in flight*, and the client never receives a response for
+    /// it. This applies to HTTP/1 requests as well as HTTP/2 streams, so a
+    /// handler that runs longer than the age limit plus the grace period will
+    /// never complete successfully. Only set a grace period if bounding
+    /// connection lifetime matters more than letting slow requests finish.
     ///
-    /// This has no effect unless [`max_connection_age`] is also set.
-    ///
-    /// [`max_connection_age`]: ConnectionLifetimeLimits::max_connection_age
-    pub fn max_connection_age_grace(mut self, grace: Duration) -> Self {
-        self.max_connection_age_grace = Some(grace);
+    /// Accepts a `Duration` or an `Option<Duration>`. `None` waits for in-flight
+    /// work for as long as it takes, which is the default.
+    pub fn grace(mut self, grace: impl Into<Option<Duration>>) -> Self {
+        self.grace = grace.into();
         self
     }
 }
@@ -358,7 +347,7 @@ pub struct Serve<L, M, S, B, E = TokioExecutor> {
     listener: L,
     make_service: M,
     executor: E,
-    connection_lifetime_limits: ConnectionLifetimeLimits,
+    max_connection_age: Option<MaxConnectionAge>,
     _marker: PhantomData<fn(B) -> S>,
 }
 
@@ -400,7 +389,7 @@ where
             listener: self.listener,
             make_service: self.make_service,
             executor: self.executor,
-            connection_lifetime_limits: self.connection_lifetime_limits,
+            max_connection_age: self.max_connection_age,
             signal,
             _marker: PhantomData,
         }
@@ -411,19 +400,23 @@ where
         self.listener.local_addr()
     }
 
-    /// Apply per-connection [`ConnectionLifetimeLimits`], bounding the lifetime of
-    /// individual connections.
+    /// Cap how long each connection keeps accepting new requests, bounding the
+    /// lifetime of individual connections.
     ///
     /// This is useful for forcing clients to rotate connections — see
-    /// [`ConnectionLifetimeLimits`] for details and an example.
+    /// [`MaxConnectionAge`] for details and an example.
+    ///
+    /// Accepts a [`MaxConnectionAge`] or an `Option<MaxConnectionAge>`, so an
+    /// optional value derived from configuration can be passed straight
+    /// through. `None` leaves connection age unbounded, which is the default.
     ///
     /// This method can be called before or after [`with_graceful_shutdown`] and
     /// [`with_executor`].
     ///
     /// [`with_graceful_shutdown`]: Serve::with_graceful_shutdown
     /// [`with_executor`]: Serve::with_executor
-    pub fn connection_lifetime_limits(mut self, limits: ConnectionLifetimeLimits) -> Self {
-        self.connection_lifetime_limits = limits;
+    pub fn max_connection_age(mut self, limits: impl Into<Option<MaxConnectionAge>>) -> Self {
+        self.max_connection_age = limits.into();
         self
     }
 
@@ -474,7 +467,7 @@ where
             listener: self.listener,
             make_service: self.make_service,
             executor,
-            connection_lifetime_limits: self.connection_lifetime_limits,
+            max_connection_age: self.max_connection_age,
             _marker: PhantomData,
         }
     }
@@ -499,7 +492,7 @@ where
             mut listener,
             mut make_service,
             executor,
-            connection_lifetime_limits,
+            max_connection_age,
             _marker,
         } = self;
 
@@ -515,7 +508,7 @@ where
                 io,
                 remote_addr,
                 &executor,
-                &connection_lifetime_limits,
+                max_connection_age.as_ref(),
             )
             .await;
         }
@@ -534,7 +527,7 @@ where
             listener,
             make_service,
             executor,
-            connection_lifetime_limits,
+            max_connection_age,
             _marker: _,
         } = self;
 
@@ -542,7 +535,7 @@ where
         s.field("listener", listener)
             .field("make_service", make_service)
             .field("executor", executor)
-            .field("connection_lifetime_limits", connection_lifetime_limits);
+            .field("max_connection_age", max_connection_age);
 
         s.finish()
     }
@@ -577,7 +570,7 @@ pub struct WithGracefulShutdown<L, M, S, F, B, E = TokioExecutor> {
     listener: L,
     make_service: M,
     executor: E,
-    connection_lifetime_limits: ConnectionLifetimeLimits,
+    max_connection_age: Option<MaxConnectionAge>,
     signal: F,
     _marker: PhantomData<fn(B) -> S>,
 }
@@ -604,18 +597,18 @@ where
             listener: self.listener,
             make_service: self.make_service,
             executor,
-            connection_lifetime_limits: self.connection_lifetime_limits,
+            max_connection_age: self.max_connection_age,
             signal: self.signal,
             _marker: PhantomData,
         }
     }
 
-    /// Apply per-connection [`ConnectionLifetimeLimits`], bounding the lifetime of
-    /// individual connections.
+    /// Cap how long each connection keeps accepting new requests, bounding the
+    /// lifetime of individual connections.
     ///
-    /// See [`Serve::connection_lifetime_limits`] and [`ConnectionLifetimeLimits`] for details.
-    pub fn connection_lifetime_limits(mut self, limits: ConnectionLifetimeLimits) -> Self {
-        self.connection_lifetime_limits = limits;
+    /// See [`Serve::max_connection_age`] and [`MaxConnectionAge`] for details.
+    pub fn max_connection_age(mut self, limits: impl Into<Option<MaxConnectionAge>>) -> Self {
+        self.max_connection_age = limits.into();
         self
     }
 }
@@ -640,7 +633,7 @@ where
             mut listener,
             mut make_service,
             executor,
-            connection_lifetime_limits,
+            max_connection_age,
             signal,
             _marker,
         } = self;
@@ -674,7 +667,7 @@ where
                 io,
                 remote_addr,
                 &executor,
-                &connection_lifetime_limits,
+                max_connection_age.as_ref(),
             )
             .await;
         }
@@ -704,7 +697,7 @@ where
             listener,
             make_service,
             executor: _,
-            connection_lifetime_limits,
+            max_connection_age,
             signal,
             _marker: _,
         } = self;
@@ -712,7 +705,7 @@ where
         f.debug_struct("WithGracefulShutdown")
             .field("listener", listener)
             .field("make_service", make_service)
-            .field("connection_lifetime_limits", connection_lifetime_limits)
+            .field("max_connection_age", max_connection_age)
             .field("signal", signal)
             .finish()
     }
@@ -762,7 +755,7 @@ async fn handle_connection<L, M, S, B, E>(
     io: <L as Listener>::Io,
     remote_addr: <L as Listener>::Addr,
     executor: &E,
-    connection_lifetime_limits: &ConnectionLifetimeLimits,
+    max_connection_age: Option<&MaxConnectionAge>,
 ) where
     L: Listener,
     L::Addr: Debug,
@@ -776,7 +769,7 @@ async fn handle_connection<L, M, S, B, E>(
     E: Executor,
 {
     let mut signal_rx = signal_rx.clone();
-    let connection_lifetime_limits = connection_lifetime_limits.clone();
+    let max_connection_age = max_connection_age.cloned();
     let io = TokioIo::new(io);
 
     trace!("connection {remote_addr:?} accepted");
@@ -818,10 +811,10 @@ async fn handle_connection<L, M, S, B, E>(
         // elapses we start a graceful shutdown of this connection and re-arm the
         // timer with the grace period (if any), which then bounds how long we
         // wait before forcibly closing.
-        let max_age = connection_lifetime_limits.max_connection_age.map(|age| {
-            let jitter = random_duration(connection_lifetime_limits.max_connection_age_jitter);
-            age.saturating_add(jitter)
-        });
+        let max_age = max_connection_age
+            .as_ref()
+            .map(|limits| limits.age.saturating_add(random_duration(limits.jitter)));
+        let grace = max_connection_age.and_then(|limits| limits.grace);
         let mut timer = pin!(sleep_or_pending(max_age));
         let mut age_fired = false;
 
@@ -849,9 +842,7 @@ async fn handle_connection<L, M, S, B, E>(
                     age_fired = true;
                     trace!("max connection age reached, starting graceful shutdown");
                     conn.as_mut().graceful_shutdown();
-                    timer.set(sleep_or_pending(
-                        connection_lifetime_limits.max_connection_age_grace,
-                    ));
+                    timer.set(sleep_or_pending(grace));
                 }
                 Either::Right((Either::Right(_), _)) => {
                     trace!("max connection age grace period elapsed, closing connection");
@@ -943,7 +934,7 @@ mod tests {
 
     #[cfg(unix)]
     use super::IncomingStream;
-    use super::{serve, ConnectionLifetimeLimits, Listener};
+    use super::{serve, Listener, MaxConnectionAge};
     #[cfg(unix)]
     use crate::extract::connect_info::Connected;
     use crate::{
@@ -1127,21 +1118,23 @@ mod tests {
         )
         .with_executor(exec);
 
-        // connection_lifetime_limits, composable with the other builder methods in any order
-        let limits = ConnectionLifetimeLimits::new()
-            .max_connection_age(Duration::from_secs(60))
-            .max_connection_age_jitter(Duration::from_secs(10))
-            .max_connection_age_grace(Duration::from_secs(5));
+        // max_connection_age, composable with the other builder methods in any order
+        let optional_max_age: Option<MaxConnectionAge> = None;
+        _ = serve(TcpListener::bind(addr).await.unwrap(), router.clone())
+            .max_connection_age(optional_max_age);
+        let max_age = MaxConnectionAge::new(Duration::from_secs(60))
+            .jitter(Duration::from_secs(10))
+            .grace(Duration::from_secs(5));
         serve(TcpListener::bind(addr).await.unwrap(), router.clone())
-            .connection_lifetime_limits(limits.clone());
+            .max_connection_age(max_age.clone());
         serve(TcpListener::bind(addr).await.unwrap(), router.clone())
-            .connection_lifetime_limits(limits.clone())
+            .max_connection_age(max_age.clone())
             .with_graceful_shutdown(std::future::pending());
         serve(TcpListener::bind(addr).await.unwrap(), router.clone())
             .with_graceful_shutdown(std::future::pending())
-            .connection_lifetime_limits(limits.clone());
+            .max_connection_age(max_age.clone());
         serve(TcpListener::bind(addr).await.unwrap(), router.clone())
-            .connection_lifetime_limits(limits.clone())
+            .max_connection_age(max_age.clone())
             .with_executor(TestExecutor::new());
     }
 
@@ -1541,9 +1534,7 @@ mod tests {
 
         tokio::spawn(
             serve(listener, app)
-                .connection_lifetime_limits(
-                    ConnectionLifetimeLimits::new().max_connection_age(Duration::from_secs(10)),
-                )
+                .max_connection_age(MaxConnectionAge::new(Duration::from_secs(10)))
                 .into_future(),
         );
 
@@ -1595,10 +1586,8 @@ mod tests {
 
         tokio::spawn(
             serve(listener, app)
-                .connection_lifetime_limits(
-                    ConnectionLifetimeLimits::new()
-                        .max_connection_age(Duration::from_secs(10))
-                        .max_connection_age_grace(Duration::from_secs(5)),
+                .max_connection_age(
+                    MaxConnectionAge::new(Duration::from_secs(10)).grace(Duration::from_secs(5)),
                 )
                 .into_future(),
         );
@@ -1657,9 +1646,7 @@ mod tests {
 
         tokio::spawn(
             serve(listener, app)
-                .connection_lifetime_limits(
-                    ConnectionLifetimeLimits::new().max_connection_age(Duration::from_secs(10)),
-                )
+                .max_connection_age(MaxConnectionAge::new(Duration::from_secs(10)))
                 .into_future(),
         );
 
@@ -1700,9 +1687,7 @@ mod tests {
 
         tokio::spawn(
             serve(listener, app)
-                .connection_lifetime_limits(
-                    ConnectionLifetimeLimits::new().max_connection_age(Duration::from_secs(10)),
-                )
+                .max_connection_age(MaxConnectionAge::new(Duration::from_secs(10)))
                 .into_future(),
         );
 
